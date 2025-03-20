@@ -1,10 +1,10 @@
-import praw
-import pandas as pd
 import os
 import json
+import time
+import praw
+import pandas as pd
 from datetime import datetime
-from prawcore.exceptions import Redirect
-
+from prawcore.exceptions import TooManyRequests
 
 #API credentials
 reddit = praw.Reddit(
@@ -13,41 +13,74 @@ reddit = praw.Reddit(
     user_agent="babey_disaster_crawler/1.0"
 )
 
-#read only true just to fetch data
 reddit.read_only = True
 
-#post-collection function ---
-def collect_posts(query, limit=10):
-    subreddit = reddit.subreddit("all")
-    posts = []
+#function that serializes a comment thread
+def serialize_comment(comment):
+    #if the comment has replies, comment metadata is stored
+    data = {
+        "comment_id": comment.id,
+        "author": str(comment.author) if comment.author else "[deleted]",
+        "body": comment.body,
+        "score": comment.score,
+        "created_utc": comment.created_utc
+    }
+    #each comment has an id, if a comment has responses, it is given a parent id
+    #if the comment has no replies, only the basic data fields are included
+    replies = []
+    if hasattr(comment, "replies"):
+        for reply in comment.replies:
+            if isinstance(reply, praw.models.Comment):
+                serialized_reply = serialize_comment(reply)
+                replies.append(serialized_reply)
+                
+    if replies:
+        data["parent_id"] = comment.parent_id
+        data["replies"] = replies
+        
+    return data
+
+#function that deals with TooManyRequests
+def safe_replace_more(comments, limit=None):
+    """
+    Repeatedly attempts to call comments.replace_more(limit=limit).
+    If TooManyRequests is encountered, waits and retries.
+    """
+    while True:
+        try:
+            comments.replace_more(limit=limit)
+            break
+        except TooManyRequests as e:
+            #wait and try again
+            wait_time = getattr(e, "retry_after", None)
+            if wait_time is None:
+                wait_time = 60  #default wait time if retry_after is None
+            print(f"Too many requests. Sleeping for {wait_time + 1} seconds...")
+            time.sleep(wait_time + 1)
+
+#collect posts from input list of subreddits
+def collect_posts_from_subreddits(subreddits, query, limit=10):
+    combined_subreddit_str = "+".join(subreddits)
+    subreddit_obj = reddit.subreddit(combined_subreddit_str)
     
-    for submission in subreddit.search(query, sort="new", time_filter="all", limit=limit):
+    posts = []
+    for submission in subreddit_obj.search(query, sort="new", time_filter="all", limit=limit):
         posts.append(submission)
     
     return posts
 
-#save comments to json
-def save_post_and_comments_to_json(submission, json_dir="json_data"):
-    #check for directory
-    os.makedirs(json_dir, exist_ok=True)
+#save posts and comments as threads in JSON structure
+def save_post_and_comments_to_json(submission, directory="LA_Wildfire_2025"):
+    os.makedirs(directory, exist_ok=True)
     
-    #retr;ieve all comments
-    submission.comments.replace_more(limit=None)
+    #handle limit rates
+    safe_replace_more(submission.comments, limit=None)
     
-    #push comment data to array
-    comments_data = []
-    for comment in submission.comments.list():
-        # Some comments may have been deleted or removed
-        comment_author = str(comment.author) if comment.author else "[deleted]"
-        comments_data.append({
-            "comment_id": comment.id,
-            "author": comment_author,
-            "body": comment.body,
-            "score": comment.score,
-            "created_utc": comment.created_utc
-        })
+    #only serialize top level comments
+    comments_data = [serialize_comment(comment)
+                     for comment in submission.comments
+                     if isinstance(comment, praw.models.Comment)]
     
-    #json structure
     post_json = {
         "post_id": submission.id,
         "title": submission.title,
@@ -61,71 +94,102 @@ def save_post_and_comments_to_json(submission, json_dir="json_data"):
         "comments": comments_data
     }
     
-    #file path
-    json_filename = f"{submission.id}.json"
-    json_path = os.path.join(json_dir, json_filename)
+    json_filename = f"wildfire_{submission.id}.json"
+    json_path = os.path.join(directory, json_filename)
     
-    #write to local folder
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(post_json, f, ensure_ascii=False, indent=2)
     
     return json_path
 
-def main():
-    #only use keyword wildfire
-    query = "wildfire"
-    limit = 500 
+#determine county info for csv data
+def get_county_info(subreddit_name):
+    sub_lower = subreddit_name.lower()
+    if sub_lower == "losangeles":
+        return "06037", "los angeles"
+    elif sub_lower == "sandiego":
+        return "06073", "san diego"
+    elif sub_lower in ["ventura", "venturacounty"]:
+        return "06111", "ventura"
+    else:
+        return "", ""
 
-    print(f"Searching Reddit for posts about '{query}'...")
-    submissions = collect_posts(query, limit=limit)
+#collect attached images if present
+def get_attached_images(submission):
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif')
+    if not submission.is_self:
+        url_lower = submission.url.lower()
+        if url_lower.endswith(image_extensions) or (hasattr(submission, "post_hint") and submission.post_hint == "image"):
+            return submission.url
+    return ""
+
+#main script to build csv and store json paths
+def main():
+    subreddits_to_search = ["LosAngeles", "sandiego", "ventura", "venturacounty"]
+    query = "wildfire"
+    limit = 200  #adjust
+    
+    print(f"Searching subreddits {subreddits_to_search} for '{query}'...")
+    submissions = collect_posts_from_subreddits(subreddits_to_search, query, limit=limit)
     
     if not submissions:
         print("No posts found for the given query.")
         return
     
-    #rows for csv
     rows = []
-    
     for i, submission in enumerate(submissions, start=1):
-        #post and comments saved to json file
-        json_path = save_post_and_comments_to_json(submission, json_dir="json_data")
+        json_path = save_post_and_comments_to_json(submission, directory="LA_Wildfire_2025")
         
-        #Build CSV rows with correct columns
+        sub_name = submission.subreddit.display_name
+        county_fips, county_subreddit_name = get_county_info(sub_name)
+        attached_images = get_attached_images(submission)
+        #csv data creation
         rows.append({
             "Index": i,
-            "PostID": submission.id,
-            "Title": submission.title,
-            "Score": submission.score,
-            "Subreddit": str(submission.subreddit),
+            "EvtName": "LA Wildfires",
+            "CountyFIPS": county_fips,
+            "CountySubredditName": county_subreddit_name,
+            "JSONPath": json_path,
+            "TitleOfThePost": submission.title,
             "Author": str(submission.author) if submission.author else "[deleted]",
             "CreatedUTC": datetime.utcfromtimestamp(submission.created_utc),
+            "Score": submission.score,
             "NumComments": submission.num_comments,
+            "Subreddit": sub_name,
             "Permalink": f"https://www.reddit.com{submission.permalink}",
             "SelfText": submission.selftext,
-            "JSONPath": json_path  # The path to the JSON file
+            "AttachedImages": attached_images,
+            "SHELDUS_Event_Name": "Wildfires_2025_CA",
+            "matched_terms": "wildfire",
+            "match_found": "yes"
         })
     
-    #create dataframe for each row
-    df = pd.DataFrame(rows, columns=[
+    columns = [
         "Index",
-        "PostID",
-        "Title",
-        "Score",
-        "Subreddit",
+        "EvtName",
+        "CountyFIPS",
+        "CountySubredditName",
+        "JSONPath",
+        "TitleOfThePost",
         "Author",
         "CreatedUTC",
+        "Score",
         "NumComments",
+        "Subreddit",
         "Permalink",
         "SelfText",
-        "JSONPath"
-    ])
+        "AttachedImages",
+        "SHELDUS_Event_Name",
+        "matched_terms",
+        "match_found"
+    ]
     
-    #save to csv
-    csv_filename = "wildfire_posts.csv"
+    df = pd.DataFrame(rows, columns=columns)
+    csv_filename = "la_wildfire_posts.csv"
     df.to_csv(csv_filename, index=False)
     
     print(f"\nCollected {len(df)} posts. Data saved to '{csv_filename}'.")
-    print("JSON files stored in the 'json_data' folder.")
+    print("JSON files (with hierarchical comment threads) stored in the 'LA_Wildfire_2025' folder.")
 
 if __name__ == "__main__":
     main()
